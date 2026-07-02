@@ -81,7 +81,7 @@ All request and response bodies are JSON except the turn stream, which is
 ### Open or reuse a session
 
 You do not have to create a session explicitly - posting a turn to a key does it
-for you. An explicit create exists for consumers that want to pre-warm or inspect:
+for you. An explicit create exists for consumers that want to pre-warm:
 
 ```
 POST /v1/sessions
@@ -93,14 +93,16 @@ Response `200`:
 ```json
 {
   "key": "discord:thread:1234",
-  "state": "active",          // "active" | "queued"
-  "queue_position": 0,         // present when state == "queued"
+  "state": "active",
   "created_at": "2026-07-02T16:00:00Z"
 }
 ```
 
-If no stick is free the session is **queued** (`state: "queued"`, with a
-`queue_position`); it becomes `active` when a stick frees up. See Backpressure.
+Explicit create **blocks until a stick is acquired** and returns `state:"active"`
+(it is a synchronous pre-warm). It does not stream, so it is not where queue
+backpressure surfaces - that's the turn stream (below), which leads with `queued`
+frames when it has to wait. Use explicit create only if you want a session warm
+before the first turn; most consumers just post a turn.
 
 ### Send a turn (the stream)
 
@@ -195,13 +197,11 @@ semaphore. The semaphore is only consulted on create/acquire and release/evict.
 ## Backpressure
 
 When all sticks are in use, new session acquisition **queues** rather than failing.
-The consumer sees this two ways, and should surface it (bloom-bot shows an
-hourglass):
-
-- On explicit `POST /v1/sessions`: response `state: "queued"` with a
-  `queue_position`.
-- On `POST .../turns`: the stream leads with `queued` event(s) carrying
-  `queue_position`, then transitions to `turn_started` when a stick is acquired.
+The consumer sees this on the turn stream and should surface it (bloom-bot shows
+an hourglass): `POST .../turns` leads with `queued` event(s) carrying a
+`queue_position`, then transitions to `turn_started` when a stick is acquired.
+(Explicit `POST /v1/sessions` blocks until warm rather than reporting a queued
+state, so the turn stream is the single place backpressure is visible.)
 
 `queue_position` is best-effort and monotonic-ish (it can only be an estimate under
 concurrency). A consumer uses it for display, not for logic. There is no hard queue
