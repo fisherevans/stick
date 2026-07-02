@@ -29,7 +29,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	factory := selectFactory(cfg.AgentMode, log)
+	factory, err := selectFactory(cfg, log)
+	if err != nil {
+		log.Error("agent factory", "err", err)
+		os.Exit(1)
+	}
 	pool := semaphore.New(cfg.Capacity)
 	mgr := session.NewManager(factory, cfg.IdleTimeout)
 	defer mgr.Close()
@@ -67,14 +71,13 @@ func main() {
 	_ = httpSrv.Shutdown(ctx)
 }
 
-// selectFactory picks the agent runtime. Only the stub exists today; the real
-// Claude-Code-per-worktree factory lands with the cluster LXC (P1b, issue #2).
-func selectFactory(mode string, log *slog.Logger) agent.Factory {
-	switch mode {
+// selectFactory picks the agent runtime: the real Claude Code CLI or the stub.
+func selectFactory(cfg *config.Config, log *slog.Logger) (agent.Factory, error) {
+	switch cfg.AgentMode {
 	case "claude":
-		log.Warn("STICK_AGENT=claude not implemented yet; using stub", "issue", "fisherevans/stick#2")
-		return agent.StubFactory{}
+		log.Info("using claude agent factory", "sessions_dir", cfg.SessionsDir, "model", cfg.ClaudeModel)
+		return agent.NewClaudeFactory(cfg.SessionsDir, cfg.ClaudeModel)
 	default:
-		return agent.StubFactory{}
+		return agent.StubFactory{}, nil
 	}
 }

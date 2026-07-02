@@ -18,6 +18,8 @@ type Config struct {
 	Capacity    int           // STICK_CAPACITY (number of sticks), default 2
 	IdleTimeout time.Duration // STICK_IDLE_TIMEOUT seconds, default 900
 	AgentMode   string        // STICK_AGENT ("stub" | "claude"), default "stub"
+	SessionsDir string        // STICK_SESSIONS_DIR (claude workdirs), default /opt/stick/sessions
+	ClaudeModel string        // STICK_CLAUDE_MODEL (optional alias), default "" (CLI default)
 
 	// Secrets maps consumer id -> client secret. Loaded from STICK_SECRETS_FILE
 	// (JSON object) if set; otherwise from STICK_SECRETS_JSON inline (dev only).
@@ -32,6 +34,8 @@ func Load() (*Config, error) {
 		Capacity:    envInt("STICK_CAPACITY", 2),
 		IdleTimeout: time.Duration(envInt("STICK_IDLE_TIMEOUT", 900)) * time.Second,
 		AgentMode:   env("STICK_AGENT", "stub"),
+		SessionsDir: env("STICK_SESSIONS_DIR", "/opt/stick/sessions"),
+		ClaudeModel: os.Getenv("STICK_CLAUDE_MODEL"),
 		Secrets:     map[string]string{},
 	}
 
