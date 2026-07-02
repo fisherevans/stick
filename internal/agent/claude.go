@@ -22,23 +22,39 @@ import (
 // Auth is the Max OAuth token in the environment (CLAUDE_CODE_OAUTH_TOKEN),
 // materialized by containers/stick/bootstrap.sh; no per-token API cost.
 type ClaudeFactory struct {
-	SessionsDir string // base dir for per-session workdirs
-	Model       string // optional model alias (e.g. "opus"); "" = CLI default
+	SessionsDir string             // base dir for per-session scratch workdirs
+	Model       string             // optional model alias (e.g. "opus"); "" = CLI default
+	Profiles    map[string]Profile // per-consumer environment overrides
 }
 
 // NewClaudeFactory builds a factory. sessionsDir is created if missing.
-func NewClaudeFactory(sessionsDir, model string) (*ClaudeFactory, error) {
+func NewClaudeFactory(sessionsDir, model string, profiles map[string]Profile) (*ClaudeFactory, error) {
 	if sessionsDir == "" {
 		sessionsDir = "/opt/stick/sessions"
 	}
 	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create sessions dir: %w", err)
 	}
-	return &ClaudeFactory{SessionsDir: sessionsDir, Model: model}, nil
+	if profiles == nil {
+		profiles = map[string]Profile{}
+	}
+	return &ClaudeFactory{SessionsDir: sessionsDir, Model: model, Profiles: profiles}, nil
 }
 
-func (f *ClaudeFactory) NewAgent(_ context.Context, sessionKey string) (Agent, error) {
-	workdir := filepath.Join(f.SessionsDir, sanitize(sessionKey))
+func (f *ClaudeFactory) NewAgent(_ context.Context, consumer, sessionKey string) (Agent, error) {
+	var workdir string
+	var addDirs []string
+	if p, ok := f.Profiles[consumer]; ok && p.Workdir != "" {
+		if p.SharedWorkdir {
+			workdir = p.Workdir
+		} else {
+			workdir = filepath.Join(p.Workdir, sanitize(sessionKey))
+		}
+		addDirs = p.AddDirs
+	} else {
+		// Generic default: an isolated scratch dir per (consumer, key).
+		workdir = filepath.Join(f.SessionsDir, sanitize(consumer), sanitize(sessionKey))
+	}
 	if err := os.MkdirAll(workdir, 0o700); err != nil {
 		return nil, fmt.Errorf("create session workdir: %w", err)
 	}
@@ -46,7 +62,17 @@ func (f *ClaudeFactory) NewAgent(_ context.Context, sessionKey string) (Agent, e
 		workdir:   workdir,
 		sessionID: uuidV4(),
 		model:     f.Model,
+		addDirs:   addDirs,
+		keepDir:   workdir != f.SessionsDir && isProfileDir(f.Profiles, consumer),
 	}, nil
+}
+
+// isProfileDir reports whether the consumer runs in a configured profile workdir
+// (which stick must not delete on session close - it's the consumer's mounted
+// data, not a scratch dir).
+func isProfileDir(profiles map[string]Profile, consumer string) bool {
+	p, ok := profiles[consumer]
+	return ok && p.Workdir != ""
 }
 
 // ClaudeAgent runs turns via the claude CLI, resuming one conversation.
@@ -54,6 +80,8 @@ type ClaudeAgent struct {
 	workdir   string
 	sessionID string
 	model     string
+	addDirs   []string
+	keepDir   bool // profile workdirs are not deleted on Close
 
 	mu    sync.Mutex
 	first bool // set true after the first turn assigns the session id
@@ -89,6 +117,9 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 		a.mu.Unlock()
 		if a.model != "" {
 			args = append(args, "--model", a.model)
+		}
+		for _, d := range a.addDirs {
+			args = append(args, "--add-dir", d)
 		}
 
 		cmd := exec.CommandContext(ctx, "claude", args...)
@@ -178,6 +209,9 @@ func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool map[string
 }
 
 func (a *ClaudeAgent) Close() error {
+	if a.keepDir {
+		return nil // profile workdir holds the consumer's data; never delete it
+	}
 	return os.RemoveAll(a.workdir)
 }
 

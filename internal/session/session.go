@@ -136,7 +136,7 @@ func (m *Manager) Ensure(ctx context.Context, consumer, key string) (*Session, b
 		return s, false, nil
 	}
 
-	ag, err := m.factory.NewAgent(ctx, key)
+	ag, err := m.factory.NewAgent(ctx, consumer, key)
 	if err != nil {
 		return nil, false, err
 	}

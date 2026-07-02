@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/fisherevans/stick/internal/agent"
 )
 
 // Config is the fully-resolved runtime configuration.
@@ -24,6 +26,11 @@ type Config struct {
 	// Secrets maps consumer id -> client secret. Loaded from STICK_SECRETS_FILE
 	// (JSON object) if set; otherwise from STICK_SECRETS_JSON inline (dev only).
 	Secrets map[string]string
+
+	// Profiles maps consumer id -> environment profile (workdir, mounts). Loaded
+	// from STICK_PROFILES_FILE (JSON object). Consumers without a profile run in
+	// a generic per-session scratch dir.
+	Profiles map[string]agent.Profile
 }
 
 // Load reads configuration from the environment. It returns an error if a
@@ -37,6 +44,7 @@ func Load() (*Config, error) {
 		SessionsDir: env("STICK_SESSIONS_DIR", "/opt/stick/sessions"),
 		ClaudeModel: os.Getenv("STICK_CLAUDE_MODEL"),
 		Secrets:     map[string]string{},
+		Profiles:    map[string]agent.Profile{},
 	}
 
 	if path := os.Getenv("STICK_SECRETS_FILE"); path != "" {
@@ -50,6 +58,16 @@ func Load() (*Config, error) {
 	} else if inline := os.Getenv("STICK_SECRETS_JSON"); inline != "" {
 		if err := json.Unmarshal([]byte(inline), &c.Secrets); err != nil {
 			return nil, fmt.Errorf("parse STICK_SECRETS_JSON: %w", err)
+		}
+	}
+
+	if path := os.Getenv("STICK_PROFILES_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read STICK_PROFILES_FILE: %w", err)
+		}
+		if err := json.Unmarshal(raw, &c.Profiles); err != nil {
+			return nil, fmt.Errorf("parse STICK_PROFILES_FILE: %w", err)
 		}
 	}
 

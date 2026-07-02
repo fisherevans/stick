@@ -75,8 +75,8 @@ func main() {
 func selectFactory(cfg *config.Config, log *slog.Logger) (agent.Factory, error) {
 	switch cfg.AgentMode {
 	case "claude":
-		log.Info("using claude agent factory", "sessions_dir", cfg.SessionsDir, "model", cfg.ClaudeModel)
-		return agent.NewClaudeFactory(cfg.SessionsDir, cfg.ClaudeModel)
+		log.Info("using claude agent factory", "sessions_dir", cfg.SessionsDir, "model", cfg.ClaudeModel, "profiles", len(cfg.Profiles))
+		return agent.NewClaudeFactory(cfg.SessionsDir, cfg.ClaudeModel, cfg.Profiles)
 	default:
 		return agent.StubFactory{}, nil
 	}

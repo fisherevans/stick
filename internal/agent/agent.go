@@ -76,8 +76,28 @@ type Agent interface {
 	Close() error
 }
 
-// Factory mints an Agent for a session. sessionKey and workdir let the real
-// implementation give each session its own worktree; the stub ignores them.
+// Factory mints an Agent for a session. consumer + sessionKey let the real
+// implementation place the session in the right environment (see Profile); the
+// stub ignores them.
 type Factory interface {
-	NewAgent(ctx context.Context, sessionKey string) (Agent, error)
+	NewAgent(ctx context.Context, consumer, sessionKey string) (Agent, error)
+}
+
+// Profile is a per-consumer session environment. A consumer with a profile runs
+// its sessions in a configured working directory (e.g. one with its data mounted
+// and its context/binaries pre-seeded) instead of a bare scratch dir, so
+// filesystem-oriented agent workflows (like ramble's composer) run unchanged.
+type Profile struct {
+	// Workdir is the base directory the consumer's sessions run in. Empty falls
+	// back to the factory's per-consumer scratch dir.
+	Workdir string `json:"workdir"`
+	// AddDirs are extra directories to grant the agent tool access to
+	// (claude --add-dir), e.g. an NFS data mount outside the workdir.
+	AddDirs []string `json:"add_dirs"`
+	// SharedWorkdir runs every session for this consumer directly in Workdir
+	// (not a per-key subdir). Suitable when the consumer's data is addressed
+	// inside the turn (ramble keys artifacts by project id) and turns are
+	// serialized by the pool. Per-session conversation continuity still holds
+	// via the session's own resume id.
+	SharedWorkdir bool `json:"shared_workdir"`
 }
