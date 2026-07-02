@@ -18,11 +18,22 @@ and structured output. The consumer owns its durable state; stick owns the
 disposable compute and the concurrency budget.
 
 stick is an **internal platform service** - zero public exposure, no human at the
-keyboard. It is distinct from the interactive operator-session path
+keyboard. It runs on the existing homelab Proxmox cluster in its own LXC, and it
+**generalizes what ramble-runner (CT 104) already does** for one app: run Claude
+Code sessions in a memory-safe LXC (the CLI OOMs in a k8s pod,
+[nottingham-cloud#121](https://github.com/fisherevans/nottingham-cloud/issues/121)),
+under a lock that caps concurrency. ramble-runner's flock is a semaphore of one;
+stick makes it a configurable pool of N and puts an authenticated streaming API in
+front of it. Sessions bill against Fisher's Max subscription via
+`CLAUDE_CODE_OAUTH_TOKEN`, not the per-token API - so a stick is a unit of
+subscription concurrency, not cost.
+
+It is distinct from the interactive operator-session path
 ([nottingham-cloud#125](https://github.com/fisherevans/nottingham-cloud/issues/125)),
-which is a human driving a remote Claude Code session by hand. The two **share the
-operator-LXC substrate** (provisioning, credential surface, worktree-per-session
-isolation) but are separate platforms with separate entry points.
+which is a human driving a remote Claude Code session by hand on a separate host
+(an old laptop, dev sessions only). The two are separate platforms on separate
+hosts; they **share provisioning patterns** (LXC bootstrap, credential surface,
+worktree-per-session), reused as code, not a shared machine.
 
 ## The contract
 
