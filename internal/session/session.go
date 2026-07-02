@@ -1,12 +1,13 @@
-// Package session manages warm, stick-holding Claude Code sessions keyed by
-// (consumer, consumer-supplied key). A session holds one semaphore Ticket for its
-// lifetime, serves sequential turns, and is evicted after an idle timeout (or an
-// explicit release), which hands its stick back to the pool.
+// Package session manages warm Claude Code sessions keyed by (consumer,
+// consumer-supplied key). A session is cheap while idle - the per-turn runtime
+// only spawns a process during a turn - so a session does NOT hold a stick for
+// its lifetime. The semaphore is acquired per turn by the API layer instead
+// (a stick gates a concurrent turn, which is what consumes RAM), which lets many
+// warm sessions coexist under a small pool. Sessions serve sequential turns and
+// are evicted after an idle timeout or an explicit release.
 //
-// Creation is serialized per key so two concurrent first-turns can't each acquire
-// a stick for the same key. The pool acquisition itself is passed in as a closure
-// so the API layer can stream queue-position backpressure while it waits, without
-// this package knowing about SSE.
+// Creation is serialized per key so two concurrent first-turns don't each spin up
+// an agent for the same key.
 package session
 
 import (
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/fisherevans/stick/internal/agent"
-	"github.com/fisherevans/stick/internal/semaphore"
 )
 
 // ErrTurnInProgress is returned when a turn is requested on a session that is
@@ -29,8 +29,7 @@ type Session struct {
 	Key       string
 	CreatedAt time.Time
 
-	ticket *semaphore.Ticket
-	agent  agent.Agent
+	agent agent.Agent
 
 	mu       sync.Mutex
 	lastUsed time.Time
@@ -72,7 +71,7 @@ func (s *Session) idleSince(cutoff time.Time) bool {
 	return !s.turnOn && s.lastUsed.Before(cutoff)
 }
 
-// close tears down the agent and returns the stick. Idempotent.
+// close tears down the agent. Idempotent.
 func (s *Session) close() {
 	s.mu.Lock()
 	if s.closed {
@@ -82,7 +81,6 @@ func (s *Session) close() {
 	s.closed = true
 	s.mu.Unlock()
 	_ = s.agent.Close()
-	s.ticket.Release()
 }
 
 // Manager owns the live session set and the idle sweeper.
@@ -121,9 +119,9 @@ func (m *Manager) Get(consumer, key string) (*Session, bool) {
 }
 
 // Ensure returns the live session for (consumer, key), creating one if absent.
-// acquire obtains a stick (it may block/queue); it is only called when a new
-// session is actually needed. The bool reports whether a session was created.
-func (m *Manager) Ensure(ctx context.Context, consumer, key string, acquire func(context.Context) (*semaphore.Ticket, error)) (*Session, bool, error) {
+// Creating a session is cheap (no stick, no process); the stick is acquired
+// per turn by the caller. The bool reports whether a session was created.
+func (m *Manager) Ensure(ctx context.Context, consumer, key string) (*Session, bool, error) {
 	sid := id(consumer, key)
 
 	if s, ok := m.Get(consumer, key); ok {
@@ -138,19 +136,14 @@ func (m *Manager) Ensure(ctx context.Context, consumer, key string, acquire func
 		return s, false, nil
 	}
 
-	ticket, err := acquire(ctx)
-	if err != nil {
-		return nil, false, err
-	}
 	ag, err := m.factory.NewAgent(ctx, key)
 	if err != nil {
-		ticket.Release()
 		return nil, false, err
 	}
 	now := time.Now()
 	s := &Session{
 		Consumer: consumer, Key: key, CreatedAt: now,
-		ticket: ticket, agent: ag, lastUsed: now,
+		agent: ag, lastUsed: now,
 	}
 	m.mu.Lock()
 	m.sessions[sid] = s

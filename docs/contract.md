@@ -16,15 +16,19 @@ Four concepts. Get these and the rest follows.
 - **Consumer** - an authenticated caller. One per app (bloom-bot is a consumer).
   Identified by a provisioned client credential. The consumer identity is the key
   for auth, per-consumer quota, and metrics tags.
-- **Stick** - a session slot. There is a fixed pool of `N` sticks across the whole
-  service. Holding a stick is permission to run one live session. Sticks are the
-  semaphore: no free stick means you queue. A released or evicted session hands its
-  stick back.
-- **Session** - a warm, long-lived Claude Code agent bound to a consumer-supplied
-  **session key**. The session holds one stick for its lifetime. Session state
-  (the agent's working context, its checkout) is **disposable compute** - stick can
-  evict it and the consumer must be able to reconstruct anything it cares about.
-  **The consumer owns durable state**, not stick.
+- **Stick** - a concurrency slot for one **turn**. There is a fixed pool of `N`
+  sticks across the whole service. Running a turn requires holding a stick; it is
+  held only for the duration of that turn and released the instant it ends. Sticks
+  are the semaphore: if all `N` are busy when you send a turn, the turn queues
+  until one frees. `N` is sized to how many turns can run at once (a turn is where
+  the compute happens), not how many sessions exist.
+- **Session** - a warm Claude Code agent bound to a consumer-supplied **session
+  key**. A session is cheap while idle: between turns there is no running process,
+  so an idle session holds **no stick** and costs ~nothing. Many warm sessions can
+  coexist under a small pool; only their *simultaneous* turns contend. Session
+  state (the agent's working context) is **disposable compute** - stick can evict
+  an idle session and the consumer must be able to reconstruct anything it cares
+  about. **The consumer owns durable state**, not stick.
 - **Turn** - one request/response exchange within a session. You send input text,
   stick streams back tokens, tool-execution events, and structured output until the
   turn completes. Turns within a session are sequential: one turn per session at a
@@ -35,14 +39,15 @@ Four concepts. Get these and the rest follows.
 A session key is any stable string the consumer chooses to mean "the same
 conversation." bloom-bot uses the Discord thread id. The rules:
 
-- First turn against a new key **creates** a session (acquiring a stick, or queuing
-  if none are free).
+- First turn against a new key **creates** a session, then acquires a stick to run
+  that turn (queuing if all sticks are busy).
 - Subsequent turns against a live key **reuse** the warm session - same agent, same
-  context, no re-acquire.
-- An idle session is **evicted** after a timeout, handing its stick back. The next
-  turn against that key transparently creates a fresh session (and may queue). A
-  consumer should treat "my session was evicted" as normal, not an error - it only
-  means in-agent context was lost, which is why durable state lives consumer-side.
+  context - and each acquires a stick just for its own duration.
+- An idle session is **evicted** after a timeout (it holds no stick, so nothing is
+  handed back - it just frees its working state). The next turn against that key
+  transparently creates a fresh session. A consumer should treat "my session was
+  evicted" as normal, not an error - it only means in-agent context was lost, which
+  is why durable state lives consumer-side.
 
 Session keys are scoped per consumer. Two consumers using the same key string get
 two independent sessions.
@@ -155,11 +160,10 @@ don't drop the connection. Clients ignore comment lines per the SSE spec.
 DELETE /v1/sessions/{key}
 ```
 
-Ends the session and hands its stick back immediately. Idempotent - deleting an
-unknown or already-evicted key is `204`, not an error. Consumers should release
-when they know a conversation is done (e.g. a thread archived) rather than waiting
-for idle eviction, so the stick returns to the pool sooner. Releasing is optional;
-idle eviction is the backstop.
+Ends the session and frees its working state immediately. Idempotent - deleting an
+unknown or already-evicted key is `204`, not an error. Releasing is optional (idle
+eviction is the backstop); it mainly frees session state sooner. It does not need
+to return a stick, because an idle session isn't holding one.
 
 ### Inspect (optional)
 
@@ -169,39 +173,34 @@ GET /v1/pool             -> { "sticks_total": N, "sticks_in_use": k, "queue_dept
 ```
 
 `GET /v1/pool` lets a consumer surface global pressure if it wants; it is not
-required for normal operation.
+required for normal operation. `sticks_in_use` is the number of turns running right
+now (not the number of sessions), and `queue_depth` is turns waiting for a stick.
 
 ## Lifecycle summary
 
 ```
-              first turn / explicit create
-consumer  ───────────────────────────────────►  acquire a stick
-                                                   │
-                            no stick free  ────────┤
-                                                   ▼
-                                              QUEUE (queued events / queue_position)
-                                                   │  stick frees up
-                                                   ▼
-                                              ACTIVE session (holds one stick)
-                                                   │
-             send-turn ──► stream frames ──► turn_completed        (repeat, warm reuse)
-                                                   │
-                    idle_timeout elapsed  ─────────┤  or  DELETE /v1/sessions/{key}
-                                                   ▼
-                                              EVICTED (stick handed back)
+   POST turn ──► WARM session (no stick while idle)
+                     │
+                     ├─► acquire a stick for THIS turn ──┐
+                     │        all sticks busy? ──► QUEUE (queued frames) ──┘
+                     ▼
+                 turn_started ──► stream frames ──► turn_completed ──► release the stick
+                     │
+                     │  (repeat; session stays warm, next turn re-acquires)
+                     ▼
+             idle_timeout / DELETE ──► EVICTED (session state freed; no stick to return)
 ```
 
-Warm reuse is the fast path: a live session answers turns without touching the
-semaphore. The semaphore is only consulted on create/acquire and release/evict.
+A session doesn't touch the semaphore just by existing; each turn borrows a stick
+for its own duration. So `N` warm sessions cost nothing when idle - contention only
+happens when more than `N` of them run a turn at the same instant.
 
 ## Backpressure
 
-When all sticks are in use, new session acquisition **queues** rather than failing.
-The consumer sees this on the turn stream and should surface it (bloom-bot shows
-an hourglass): `POST .../turns` leads with `queued` event(s) carrying a
-`queue_position`, then transitions to `turn_started` when a stick is acquired.
-(Explicit `POST /v1/sessions` blocks until warm rather than reporting a queued
-state, so the turn stream is the single place backpressure is visible.)
+When all sticks are busy, a new **turn** **queues** rather than failing. The
+consumer sees this on the turn stream and should surface it (bloom-bot shows an
+hourglass): `POST .../turns` leads with `queued` event(s) carrying a
+`queue_position`, then transitions to `turn_started` once a stick is acquired.
 
 `queue_position` is best-effort and monotonic-ish (it can only be an estimate under
 concurrency). A consumer uses it for display, not for logic. There is no hard queue

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/fisherevans/stick/internal/agent"
 	"github.com/fisherevans/stick/internal/auth"
 	"github.com/fisherevans/stick/internal/semaphore"
 	"github.com/fisherevans/stick/internal/session"
@@ -86,9 +85,9 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "missing or invalid session key")
 		return
 	}
-	// Explicit create blocks until a stick is warm (returns active). Queue
-	// backpressure is surfaced on the streaming turn endpoint, not here.
-	sess, _, err := s.sessions.Ensure(r.Context(), consumer, body.Key, s.blockingAcquire(r.Context()))
+	// Creating a session is cheap (no stick held until a turn runs), so this
+	// returns immediately. Queue backpressure surfaces on the turn stream.
+	sess, _, err := s.sessions.Ensure(r.Context(), consumer, body.Key)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return
@@ -127,42 +126,39 @@ func (s *Server) sendTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Warm fast path: a live session can 409 before we commit to a stream.
-	if sess, ok := s.sessions.Get(consumer, key); ok {
-		if err := sess.BeginTurn(); err != nil {
-			if errors.Is(err, session.ErrTurnInProgress) {
-				writeErr(w, http.StatusConflict, "turn_in_progress", "a turn is already streaming for this session")
-				return
-			}
-			writeErr(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		defer sess.EndTurn()
-		sse, ok := newSSE(w)
-		if !ok {
-			writeErr(w, http.StatusInternalServerError, "internal", "streaming unsupported")
-			return
-		}
-		s.runTurn(r.Context(), sse, sess, body.Input)
+	// Get or create the warm session (cheap: no stick until a turn runs).
+	sess, _, err := s.sessions.Ensure(r.Context(), consumer, key)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return
 	}
 
-	// Create path: may queue, so stream from the start to carry `queued` frames.
+	// Reserve the (sequential) turn slot before committing to a stream, so a
+	// busy session 409s cleanly rather than mid-stream.
+	if err := sess.BeginTurn(); err != nil {
+		if errors.Is(err, session.ErrTurnInProgress) {
+			writeErr(w, http.StatusConflict, "turn_in_progress", "a turn is already streaming for this session")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	defer sess.EndTurn()
+
 	sse, ok := newSSE(w)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "internal", "streaming unsupported")
 		return
 	}
-	sess, _, err := s.sessions.Ensure(r.Context(), consumer, key, s.streamingAcquire(r.Context(), sse))
+
+	// Acquire a stick for the duration of this turn, streaming `queued` frames
+	// while all sticks are busy. Released as soon as the turn ends.
+	ticket, err := s.acquireStreaming(r.Context(), sse)
 	if err != nil {
-		_ = sse.event(string(agent.KindError), agent.ErrorData{Code: "internal", Message: "could not acquire a session"})
-		return
+		return // ctx cancelled; consumer went away
 	}
-	if err := sess.BeginTurn(); err != nil {
-		_ = sse.event(string(agent.KindError), agent.ErrorData{Code: "turn_in_progress", Message: err.Error()})
-		return
-	}
-	defer sess.EndTurn()
+	defer ticket.Release()
+
 	s.runTurn(r.Context(), sse, sess, body.Input)
 }
 
@@ -194,41 +190,26 @@ func (s *Server) runTurn(ctx context.Context, sse *sseWriter, sess *session.Sess
 	}
 }
 
-// blockingAcquire waits for a stick, no streaming (used by explicit create).
-func (s *Server) blockingAcquire(_ context.Context) func(context.Context) (*semaphore.Ticket, error) {
-	return func(ctx context.Context) (*semaphore.Ticket, error) {
-		w := s.pool.Acquire(ctx)
+// acquireStreaming waits for a stick, emitting `queued` frames while all sticks
+// are busy, and returns the granted Ticket. Errors only if ctx is cancelled.
+func (s *Server) acquireStreaming(ctx context.Context, sse *sseWriter) (*semaphore.Ticket, error) {
+	w := s.pool.Acquire(ctx)
+	if pos := w.Position(); pos > 0 {
+		_ = sse.event("queued", queuedData{QueuePosition: pos})
+	}
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
 		select {
-		case t := <-w.Granted():
-			return t, nil
+		case tk := <-w.Granted():
+			return tk, nil
+		case <-t.C:
+			if pos := w.Position(); pos > 0 {
+				_ = sse.event("queued", queuedData{QueuePosition: pos})
+			}
 		case <-ctx.Done():
 			w.Cancel()
 			return nil, ctx.Err()
-		}
-	}
-}
-
-// streamingAcquire waits for a stick, emitting `queued` frames while it waits.
-func (s *Server) streamingAcquire(_ context.Context, sse *sseWriter) func(context.Context) (*semaphore.Ticket, error) {
-	return func(ctx context.Context) (*semaphore.Ticket, error) {
-		w := s.pool.Acquire(ctx)
-		if pos := w.Position(); pos > 0 {
-			_ = sse.event("queued", queuedData{QueuePosition: pos})
-		}
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case tk := <-w.Granted():
-				return tk, nil
-			case <-t.C:
-				if pos := w.Position(); pos > 0 {
-					_ = sse.event("queued", queuedData{QueuePosition: pos})
-				}
-			case <-ctx.Done():
-				w.Cancel()
-				return nil, ctx.Err()
-			}
 		}
 	}
 }
