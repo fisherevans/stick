@@ -28,16 +28,20 @@ func NewServer(pool *semaphore.Pool, sessions *session.Manager, registry *auth.R
 	return &Server{pool: pool, sessions: sessions, auth: registry}
 }
 
-// Handler returns the fully-routed, authenticated handler.
+// Handler returns the fully-routed handler. The /v1 API is authenticated; the
+// health endpoint is open so probes don't need a secret.
 func (s *Server) Handler() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("POST /v1/sessions", s.createSession)
+	api.HandleFunc("POST /v1/sessions/{key}/turns", s.sendTurn)
+	api.HandleFunc("GET /v1/sessions/{key}", s.getSession)
+	api.HandleFunc("DELETE /v1/sessions/{key}", s.deleteSession)
+	api.HandleFunc("GET /v1/pool", s.getPool)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/sessions", s.createSession)
-	mux.HandleFunc("POST /v1/sessions/{key}/turns", s.sendTurn)
-	mux.HandleFunc("GET /v1/sessions/{key}", s.getSession)
-	mux.HandleFunc("DELETE /v1/sessions/{key}", s.deleteSession)
-	mux.HandleFunc("GET /v1/pool", s.getPool)
+	mux.Handle("/v1/", s.auth.Middleware(api))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	return s.auth.Middleware(mux)
+	return mux
 }
 
 // --- wire types (see docs/contract.md) ---
