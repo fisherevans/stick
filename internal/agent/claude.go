@@ -27,6 +27,7 @@ type ClaudeFactory struct {
 	SessionsDir string             // base dir for per-session scratch workdirs
 	Model       string             // optional model alias (e.g. "opus"); "" = CLI default
 	Profiles    map[string]Profile // per-consumer environment overrides
+	SelfPath    string             // path to the stick binary (spawned as the MCP server for tools)
 }
 
 // NewClaudeFactory builds a factory. sessionsDir is created if missing.
@@ -40,10 +41,14 @@ func NewClaudeFactory(sessionsDir, model string, profiles map[string]Profile) (*
 	if profiles == nil {
 		profiles = map[string]Profile{}
 	}
-	return &ClaudeFactory{SessionsDir: sessionsDir, Model: model, Profiles: profiles}, nil
+	self, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve stick binary path: %w", err)
+	}
+	return &ClaudeFactory{SessionsDir: sessionsDir, Model: model, Profiles: profiles, SelfPath: self}, nil
 }
 
-func (f *ClaudeFactory) NewAgent(_ context.Context, consumer, sessionKey string) (Agent, error) {
+func (f *ClaudeFactory) NewAgent(_ context.Context, consumer, sessionKey string, tools []Tool) (Agent, error) {
 	var workdir string
 	var addDirs []string
 	if p, ok := f.Profiles[consumer]; ok && p.Workdir != "" {
@@ -60,13 +65,61 @@ func (f *ClaudeFactory) NewAgent(_ context.Context, consumer, sessionKey string)
 	if err := os.MkdirAll(workdir, 0o700); err != nil {
 		return nil, fmt.Errorf("create session workdir: %w", err)
 	}
-	return &ClaudeAgent{
+	a := &ClaudeAgent{
 		workdir:   workdir,
 		sessionID: uuidV4(),
 		model:     f.Model,
 		addDirs:   addDirs,
 		keepDir:   workdir != f.SessionsDir && isProfileDir(f.Profiles, consumer),
-	}, nil
+	}
+	if len(tools) > 0 {
+		if err := a.setupTools(f.SelfPath, tools); err != nil {
+			return nil, fmt.Errorf("set up session tools: %w", err)
+		}
+	}
+	return a, nil
+}
+
+// setupTools writes the MCP tools file + config into the session workdir and
+// records the tool_use name -> structured_output name mapping. selfPath is the
+// stick binary the CLI spawns as the stdio MCP server (`stick mcp-serve`).
+func (a *ClaudeAgent) setupTools(selfPath string, tools []Tool) error {
+	defs := make([]mcpToolDef, 0, len(tools))
+	a.outputTools = map[string]string{}
+	for _, t := range tools {
+		out := t.OutputName
+		if out == "" {
+			out = t.Name
+		}
+		a.outputTools["mcp__stick__"+t.Name] = out
+		defs = append(defs, mcpToolDef{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+	}
+	toolsPath := filepath.Join(a.workdir, ".stick-tools.json")
+	toolsJSON, err := json.Marshal(defs)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(toolsPath, toolsJSON, 0o600); err != nil {
+		return err
+	}
+	cfg := map[string]any{"mcpServers": map[string]any{
+		"stick": map[string]any{"command": selfPath, "args": []string{"mcp-serve", "--tools", toolsPath}},
+	}}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	a.mcpConfigPath = filepath.Join(a.workdir, ".stick-mcp.json")
+	return os.WriteFile(a.mcpConfigPath, cfgJSON, 0o600)
+}
+
+// mcpToolDef mirrors internal/mcp.ToolDef (declared here to avoid an import cycle
+// between agent and mcp; mcp imports nothing from agent, and the on-disk shape is
+// the contract between them).
+type mcpToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
 // isProfileDir reports whether the consumer runs in a configured profile workdir
@@ -79,11 +132,13 @@ func isProfileDir(profiles map[string]Profile, consumer string) bool {
 
 // ClaudeAgent runs turns via the claude CLI, resuming one conversation.
 type ClaudeAgent struct {
-	workdir   string
-	sessionID string
-	model     string
-	addDirs   []string
-	keepDir   bool // profile workdirs are not deleted on Close
+	workdir       string
+	sessionID     string
+	model         string
+	addDirs       []string
+	keepDir       bool              // profile workdirs are not deleted on Close
+	mcpConfigPath string            // --mcp-config for consumer-declared tools ("" = none)
+	outputTools   map[string]string // mcp tool_use name -> structured_output name
 
 	mu           sync.Mutex
 	first        bool  // set true after the first turn assigns the session id
@@ -133,6 +188,11 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 		for _, d := range a.addDirs {
 			args = append(args, "--add-dir", d)
 		}
+		if a.mcpConfigPath != "" {
+			// Expose the consumer's declared tools over MCP. --dangerously-skip-permissions
+			// already allows them; the tool_use args are read from the stream below.
+			args = append(args, "--mcp-config", a.mcpConfigPath, "--strict-mcp-config")
+		}
 
 		cmd := exec.CommandContext(ctx, "claude", args...)
 		cmd.Dir = a.workdir
@@ -149,11 +209,12 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 		}
 
 		seenTool := map[string]bool{}
+		outIDs := map[string]bool{} // tool_use ids that are output-tool calls (their results are acks, not tool_end)
 		completed := false
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 0, 128*1024), 8*1024*1024)
 		for sc.Scan() {
-			if !a.handleLine(sc.Bytes(), turnID, seenTool, &completed, emit) {
+			if !a.handleLine(sc.Bytes(), turnID, seenTool, outIDs, &completed, emit) {
 				break
 			}
 		}
@@ -178,7 +239,7 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 
 // handleLine parses one stream-json line and emits mapped events. Returns false
 // if the consumer went away (emit failed).
-func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool map[string]bool, completed *bool, emit func(Event) bool) bool {
+func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool, outIDs map[string]bool, completed *bool, emit func(Event) bool) bool {
 	var msg claudeLine
 	if err := json.Unmarshal(line, &msg); err != nil {
 		return true // tolerate non-JSON / partial lines
@@ -191,22 +252,37 @@ func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool map[string
 			return emit(Event{KindToken, TokenData{Text: msg.Event.Delta.Text}})
 		}
 	case "assistant":
-		// Tool calls the assistant decided on -> tool_start (deduped by id).
+		// Tool calls the assistant decided on.
 		if msg.Message != nil {
 			for _, b := range msg.Message.Content {
-				if b.Type == "tool_use" && b.ID != "" && !seenTool[b.ID] {
-					seenTool[b.ID] = true
-					if !emit(Event{KindToolStart, ToolStartData{Tool: b.Name, ToolCallID: b.ID, Title: b.Name}}) {
+				if b.Type != "tool_use" || b.ID == "" || seenTool[b.ID] {
+					continue
+				}
+				seenTool[b.ID] = true
+				// A declared output tool -> the structured result the consumer wants,
+				// carried in the tool_use input (name is mcp__stick__<tool>). Emit
+				// structured_output, not tool_start; its ack tool_result is suppressed below.
+				if out, ok := a.outputTools[b.Name]; ok {
+					outIDs[b.ID] = true
+					val := b.Input
+					if len(val) == 0 {
+						val = json.RawMessage("null")
+					}
+					if !emit(Event{KindStructuredOutput, StructuredOutputData{Name: out, Value: val}}) {
 						return false
 					}
+					continue
+				}
+				if !emit(Event{KindToolStart, ToolStartData{Tool: b.Name, ToolCallID: b.ID, Title: b.Name}}) {
+					return false
 				}
 			}
 		}
 	case "user":
-		// Tool results -> tool_end.
+		// Tool results -> tool_end (except output-tool acks, which are internal).
 		if msg.Message != nil {
 			for _, b := range msg.Message.Content {
-				if b.Type == "tool_result" && b.ToolUseID != "" {
+				if b.Type == "tool_result" && b.ToolUseID != "" && !outIDs[b.ToolUseID] {
 					status := "ok"
 					if b.IsError {
 						status = "error"
@@ -296,11 +372,12 @@ type claudeMessage struct {
 }
 
 type claudeBlock struct {
-	Type      string `json:"type"`
-	Name      string `json:"name"`        // tool_use
-	ID        string `json:"id"`          // tool_use
-	ToolUseID string `json:"tool_use_id"` // tool_result
-	IsError   bool   `json:"is_error"`    // tool_result
+	Type      string          `json:"type"`
+	Name      string          `json:"name"`        // tool_use
+	ID        string          `json:"id"`          // tool_use
+	Input     json.RawMessage `json:"input"`       // tool_use args
+	ToolUseID string          `json:"tool_use_id"` // tool_result
+	IsError   bool            `json:"is_error"`    // tool_result
 }
 
 type claudeEvent struct {

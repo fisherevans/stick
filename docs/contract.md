@@ -90,8 +90,12 @@ for you. An explicit create exists for consumers that want to pre-warm:
 
 ```
 POST /v1/sessions
-{ "key": "discord:thread:1234", "idle_timeout_seconds": 900 }
+{ "key": "discord:thread:1234", "idle_timeout_seconds": 900, "tools": [ ... ] }
 ```
+
+`tools` (optional) declares **output tools** the session's agent can call to return
+structured data - see "Declaring tools" below. They bind to the session at
+creation and hold for its warm life.
 
 Response `200`:
 
@@ -167,6 +171,59 @@ Guarantees:
 
 Heartbeats: stick sends SSE comment lines (`: ping`) periodically so idle proxies
 don't drop the connection. Clients ignore comment lines per the SSE spec.
+
+### Declaring tools (structured output)
+
+A consumer that needs **structured** results - not prose it has to parse - declares
+**output tools**. Each is a named tool with a JSON input schema; the agent calls it
+with a structured argument, and stick surfaces that argument to the consumer as a
+`structured_output` frame. This is the reliable path: the runtime validates the call
+against the schema and the agent can emit it mid-turn as a native action, so it holds
+up for multi-step workflows where a trailing text block would not.
+
+Declare tools on `POST /v1/sessions` or on the first turn's `tools` field:
+
+```json
+{
+  "tools": [
+    {
+      "name": "emit_node",
+      "description": "Return the node: a short read plus 3-5 options the reader can pick.",
+      "output_name": "node",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "read": { "type": "string" },
+          "options": { "type": "array", "items": {
+            "type": "object",
+            "properties": { "label": {"type":"string"}, "lead_in": {"type":"string"} },
+            "required": ["label", "lead_in"] } }
+        },
+        "required": ["read", "options"]
+      }
+    }
+  ]
+}
+```
+
+When the agent calls `emit_node`, the consumer receives:
+
+```
+event: structured_output
+data: { "name": "node", "value": { "read": "...", "options": [ ... ] } }
+```
+
+Notes:
+- `output_name` is the `structured_output` `name` (defaults to the tool name). It lets
+  you call the tool `emit_node` but decode a frame named `node`.
+- Tools are exposed to the underlying Claude Code session over MCP; the agent sees them
+  as native, schema-validated tools. Prompt the agent to call the tool (e.g. "when done,
+  call `emit_node` with the node").
+- Output-tool calls do **not** produce `tool_start`/`tool_end` frames (they're the
+  result channel, not user-facing tool activity). Other tools the agent uses still do.
+- Round-trip **callback tools** (the agent calling back into the consumer mid-turn for
+  data) are a planned extension on this same surface (fisherevans/stick#9); output tools
+  are the one-way subset.
 
 ### Release a session
 

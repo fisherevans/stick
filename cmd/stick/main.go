@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,12 +20,21 @@ import (
 	"github.com/fisherevans/stick/internal/api"
 	"github.com/fisherevans/stick/internal/auth"
 	"github.com/fisherevans/stick/internal/config"
+	"github.com/fisherevans/stick/internal/mcp"
 	"github.com/fisherevans/stick/internal/metrics"
 	"github.com/fisherevans/stick/internal/semaphore"
 	"github.com/fisherevans/stick/internal/session"
 )
 
 func main() {
+	// Subcommand: run as the stdio MCP server the CLI spawns for a session's
+	// consumer-declared tools. Kept in the same binary so there's one artifact to
+	// deploy; the session's --mcp-config points `command` at this exe + mcp-serve.
+	if len(os.Args) > 1 && os.Args[1] == "mcp-serve" {
+		runMCPServe(os.Args[2:])
+		return
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	cfg, err := config.Load()
@@ -96,6 +106,26 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+}
+
+// runMCPServe runs the stdio MCP server for a session's declared tools and exits.
+func runMCPServe(args []string) {
+	fs := flag.NewFlagSet("mcp-serve", flag.ExitOnError)
+	toolsPath := fs.String("tools", "", "path to the tools JSON file stick wrote for this session")
+	_ = fs.Parse(args)
+	var tools []mcp.ToolDef
+	if *toolsPath != "" {
+		t, err := mcp.LoadTools(*toolsPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "mcp-serve:", err)
+			os.Exit(1)
+		}
+		tools = t
+	}
+	if err := mcp.Serve(os.Stdin, os.Stdout, tools); err != nil {
+		fmt.Fprintln(os.Stderr, "mcp-serve:", err)
+		os.Exit(1)
+	}
 }
 
 // hostStats reads box-level pressure from /proc: available memory (MB) and the

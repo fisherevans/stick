@@ -120,8 +120,10 @@ func (m *Manager) Get(consumer, key string) (*Session, bool) {
 
 // Ensure returns the live session for (consumer, key), creating one if absent.
 // Creating a session is cheap (no stick, no process); the stick is acquired
-// per turn by the caller. The bool reports whether a session was created.
-func (m *Manager) Ensure(ctx context.Context, consumer, key string) (*Session, bool, error) {
+// per turn by the caller. tools are the consumer-declared output tools bound to
+// the session at creation; they are ignored if the session already exists (tools
+// are fixed for a warm session's life). The bool reports whether one was created.
+func (m *Manager) Ensure(ctx context.Context, consumer, key string, tools []agent.Tool) (*Session, bool, error) {
 	sid := id(consumer, key)
 
 	if s, ok := m.Get(consumer, key); ok {
@@ -136,7 +138,7 @@ func (m *Manager) Ensure(ctx context.Context, consumer, key string) (*Session, b
 		return s, false, nil
 	}
 
-	ag, err := m.factory.NewAgent(ctx, consumer, key)
+	ag, err := m.factory.NewAgent(ctx, consumer, key, tools)
 	if err != nil {
 		return nil, false, err
 	}

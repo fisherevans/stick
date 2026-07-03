@@ -10,7 +10,10 @@
 // acquired, not by the agent.
 package agent
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Kind is the event discriminator; its string value is the SSE `event:` name.
 type Kind string
@@ -94,10 +97,28 @@ type Agent interface {
 }
 
 // Factory mints an Agent for a session. consumer + sessionKey let the real
-// implementation place the session in the right environment (see Profile); the
-// stub ignores them.
+// implementation place the session in the right environment (see Profile); tools
+// are the consumer-declared output tools the session exposes (see Tool). The stub
+// ignores all three.
 type Factory interface {
-	NewAgent(ctx context.Context, consumer, sessionKey string) (Agent, error)
+	NewAgent(ctx context.Context, consumer, sessionKey string, tools []Tool) (Agent, error)
+}
+
+// Tool is a consumer-declared tool the agent can call during a turn. Today only
+// "output" tools exist: the agent calls the tool with a structured argument, and
+// stick surfaces that argument to the consumer as a structured_output frame
+// (named OutputName). This is the reliable, schema-validated path for structured
+// results - the runtime validates the call against InputSchema, so it holds up
+// for multi-step workflows where a trailing text block would not. Tools are
+// exposed to the Claude Code session over MCP (see internal/mcp).
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+	// OutputName is the structured_output `name` stick emits when the agent calls
+	// this tool; defaults to Name. Lets a consumer name a tool `emit_node` but
+	// receive a structured_output named `node`.
+	OutputName string `json:"output_name,omitempty"`
 }
 
 // Profile is a per-consumer session environment. A consumer with a profile runs
