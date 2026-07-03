@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -208,13 +209,17 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 			return
 		}
 
-		seenTool := map[string]bool{}
-		outIDs := map[string]bool{} // tool_use ids that are output-tool calls (their results are acks, not tool_end)
+		st := &turnState{
+			seenTool:    map[string]bool{},
+			outToolIDs:  map[string]bool{},
+			pendingOut:  map[string]json.RawMessage{},
+			pendingName: map[string]string{},
+		}
 		completed := false
 		sc := bufio.NewScanner(stdout)
 		sc.Buffer(make([]byte, 0, 128*1024), 8*1024*1024)
 		for sc.Scan() {
-			if !a.handleLine(sc.Bytes(), turnID, seenTool, outIDs, &completed, emit) {
+			if !a.handleLine(sc.Bytes(), turnID, st, &completed, emit) {
 				break
 			}
 		}
@@ -239,7 +244,15 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 
 // handleLine parses one stream-json line and emits mapped events. Returns false
 // if the consumer went away (emit failed).
-func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool, outIDs map[string]bool, completed *bool, emit func(Event) bool) bool {
+// turnState is the per-turn bookkeeping handleLine threads across stream lines.
+type turnState struct {
+	seenTool    map[string]bool            // normal tools already announced (tool_start dedup)
+	outToolIDs  map[string]bool            // tool_use ids that are output-tool calls
+	pendingOut  map[string]json.RawMessage // id -> latest well-formed output-tool input
+	pendingName map[string]string          // id -> structured_output name
+}
+
+func (a *ClaudeAgent) handleLine(line []byte, turnID string, st *turnState, completed *bool, emit func(Event) bool) bool {
 	var msg claudeLine
 	if err := json.Unmarshal(line, &msg); err != nil {
 		return true // tolerate non-JSON / partial lines
@@ -252,44 +265,58 @@ func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool, outIDs ma
 			return emit(Event{KindToken, TokenData{Text: msg.Event.Delta.Text}})
 		}
 	case "assistant":
-		// Tool calls the assistant decided on.
+		// Tool calls the assistant decided on. With --include-partial-messages the
+		// same tool_use id can appear across several assistant frames as its input
+		// streams in; for output tools we capture the latest well-formed input and
+		// emit a single structured_output when its tool_result lands (below).
 		if msg.Message != nil {
 			for _, b := range msg.Message.Content {
-				if b.Type != "tool_use" || b.ID == "" || seenTool[b.ID] {
+				if b.Type != "tool_use" || b.ID == "" {
 					continue
 				}
-				seenTool[b.ID] = true
-				// A declared output tool -> the structured result the consumer wants,
-				// carried in the tool_use input (name is mcp__stick__<tool>). Emit
-				// structured_output, not tool_start; its ack tool_result is suppressed below.
 				if out, ok := a.outputTools[b.Name]; ok {
-					outIDs[b.ID] = true
-					val := b.Input
-					if len(val) == 0 {
-						val = json.RawMessage("null")
+					st.outToolIDs[b.ID] = true
+					st.pendingName[b.ID] = out
+					// Skip the CLI's partial/unparsed snapshots; keep the last good one.
+					if len(b.Input) > 0 && !bytes.Contains(b.Input, []byte("__unparsedToolInput")) {
+						st.pendingOut[b.ID] = b.Input
 					}
-					if !emit(Event{KindStructuredOutput, StructuredOutputData{Name: out, Value: val}}) {
+					continue
+				}
+				if !st.seenTool[b.ID] {
+					st.seenTool[b.ID] = true
+					if !emit(Event{KindToolStart, ToolStartData{Tool: b.Name, ToolCallID: b.ID, Title: b.Name}}) {
 						return false
 					}
-					continue
-				}
-				if !emit(Event{KindToolStart, ToolStartData{Tool: b.Name, ToolCallID: b.ID, Title: b.Name}}) {
-					return false
 				}
 			}
 		}
 	case "user":
-		// Tool results -> tool_end (except output-tool acks, which are internal).
+		// Tool results. An output-tool result is the "call complete" signal: emit
+		// its captured input as structured_output and swallow the ack. Other tools
+		// map to tool_end.
 		if msg.Message != nil {
 			for _, b := range msg.Message.Content {
-				if b.Type == "tool_result" && b.ToolUseID != "" && !outIDs[b.ToolUseID] {
-					status := "ok"
-					if b.IsError {
-						status = "error"
+				if b.Type != "tool_result" || b.ToolUseID == "" {
+					continue
+				}
+				if st.outToolIDs[b.ToolUseID] {
+					val, ok := st.pendingOut[b.ToolUseID]
+					if !ok {
+						val = json.RawMessage("null")
 					}
-					if !emit(Event{KindToolEnd, ToolEndData{ToolCallID: b.ToolUseID, Status: status}}) {
+					delete(st.pendingOut, b.ToolUseID)
+					if !emit(Event{KindStructuredOutput, StructuredOutputData{Name: st.pendingName[b.ToolUseID], Value: val}}) {
 						return false
 					}
+					continue
+				}
+				status := "ok"
+				if b.IsError {
+					status = "error"
+				}
+				if !emit(Event{KindToolEnd, ToolEndData{ToolCallID: b.ToolUseID, Status: status}}) {
+					return false
 				}
 			}
 		}
