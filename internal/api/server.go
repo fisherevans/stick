@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/fisherevans/stick/internal/agent"
 	"github.com/fisherevans/stick/internal/auth"
+	"github.com/fisherevans/stick/internal/metrics"
 	"github.com/fisherevans/stick/internal/semaphore"
 	"github.com/fisherevans/stick/internal/session"
 )
@@ -21,10 +23,14 @@ type Server struct {
 	pool     *semaphore.Pool
 	sessions *session.Manager
 	auth     *auth.Registry
+	metrics  *metrics.Sink
 }
 
-func NewServer(pool *semaphore.Pool, sessions *session.Manager, registry *auth.Registry) *Server {
-	return &Server{pool: pool, sessions: sessions, auth: registry}
+func NewServer(pool *semaphore.Pool, sessions *session.Manager, registry *auth.Registry, sink *metrics.Sink) *Server {
+	if sink == nil {
+		sink = metrics.NewDisabled()
+	}
+	return &Server{pool: pool, sessions: sessions, auth: registry, metrics: sink}
 }
 
 // Handler returns the fully-routed handler. The /v1 API is authenticated; the
@@ -153,39 +159,84 @@ func (s *Server) sendTurn(w http.ResponseWriter, r *http.Request) {
 
 	// Acquire a stick for the duration of this turn, streaming `queued` frames
 	// while all sticks are busy. Released as soon as the turn ends.
+	qStart := time.Now()
 	ticket, err := s.acquireStreaming(r.Context(), sse)
 	if err != nil {
 		return // ctx cancelled; consumer went away
 	}
 	defer ticket.Release()
+	queueWait := time.Since(qStart)
 
-	s.runTurn(r.Context(), sse, sess, body.Input)
+	start := time.Now()
+	status, usage := s.runTurn(r.Context(), sse, sess, body.Input)
+	s.recordTurn(consumer, sess.Agent(), status, usage, queueWait, time.Since(start))
 }
 
-// runTurn emits turn_started then forwards agent events, with periodic heartbeats.
-func (s *Server) runTurn(ctx context.Context, sse *sseWriter, sess *session.Session, input string) {
+// runTurn emits turn_started then forwards agent events, with periodic
+// heartbeats. It returns the terminal status ("ok" | "error" | "aborted") and
+// the turn's usage (nil if none was reported), for metrics.
+func (s *Server) runTurn(ctx context.Context, sse *sseWriter, sess *session.Session, input string) (string, *agent.Usage) {
 	turnID := newID("t")
 	if err := sse.event("turn_started", turnStartedData{TurnID: turnID, SessionKey: sess.Key}); err != nil {
-		return
+		return "aborted", nil
 	}
 	ch := sess.Agent().RunTurn(ctx, turnID, input)
 	hb := time.NewTicker(15 * time.Second)
 	defer hb.Stop()
+	status := "aborted"
+	var usage *agent.Usage
 	for {
 		select {
 		case e, ok := <-ch:
 			if !ok {
-				return
+				return status, usage
+			}
+			switch e.Kind {
+			case agent.KindTurnCompleted:
+				status = "ok"
+				if d, ok := e.Data.(agent.TurnCompletedData); ok {
+					usage = d.Usage
+				}
+			case agent.KindError:
+				status = "error"
 			}
 			if err := sse.event(string(e.Kind), e.Data); err != nil {
-				return
+				return status, usage
 			}
 		case <-hb.C:
 			if err := sse.comment("ping"); err != nil {
-				return
+				return status, usage
 			}
 		case <-ctx.Done():
-			return
+			return status, usage
+		}
+	}
+}
+
+// recordTurn ships per-turn usage, cost, timing, and resource metrics, tagged by
+// consumer and model so usage breaks down per consumer.
+func (s *Server) recordTurn(consumer string, ag agent.Agent, status string, u *agent.Usage, queueWait, dur time.Duration) {
+	if !s.metrics.Enabled() {
+		return
+	}
+	model := "unknown"
+	if u != nil && u.Model != "" {
+		model = u.Model
+	}
+	cm := []string{"consumer:" + consumer, "model:" + model}
+	s.metrics.Count("stick.turn.count", 1, append(cm, "status:"+status)...)
+	s.metrics.Gauge("stick.turn.duration_ms", float64(dur.Milliseconds()), cm...)
+	s.metrics.Gauge("stick.turn.queue_wait_ms", float64(queueWait.Milliseconds()), "consumer:"+consumer)
+	if u != nil {
+		s.metrics.Count("stick.turn.tokens.input", float64(u.InputTokens), cm...)
+		s.metrics.Count("stick.turn.tokens.output", float64(u.OutputTokens), cm...)
+		s.metrics.Count("stick.turn.tokens.cache_read", float64(u.CacheReadInputTokens), cm...)
+		s.metrics.Count("stick.turn.tokens.cache_write", float64(u.CacheCreationInputTokens), cm...)
+		s.metrics.Count("stick.turn.cost_usd", u.CostUSD, cm...)
+	}
+	if rp, ok := ag.(interface{ LastMaxRSSKB() int64 }); ok {
+		if kb := rp.LastMaxRSSKB(); kb > 0 {
+			s.metrics.Gauge("stick.turn.max_rss_kb", float64(kb), "consumer:"+consumer)
 		}
 	}
 }

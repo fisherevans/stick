@@ -129,7 +129,7 @@ queuing). The response is an SSE stream. Each event has a named `event:` and a J
 | `tool_start` | the agent began a tool call | `{ "tool": "web_fetch", "tool_call_id": "tc_1", "title": "Fetching article" }` |
 | `tool_end` | a tool call finished | `{ "tool_call_id": "tc_1", "status": "ok" \| "error", "summary": "..." }` |
 | `structured_output` | a structured result the agent emitted | `{ "name": "article_summary", "value": { ... } }` |
-| `turn_completed` | the turn finished cleanly | `{ "turn_id": "t_abc", "stop_reason": "end_turn" }` |
+| `turn_completed` | the turn finished cleanly | `{ "turn_id": "t_abc", "stop_reason": "end_turn", "usage": { ... } }` |
 | `error` | the turn failed | `{ "code": "...", "message": "..." }` - terminal, stream then closes |
 
 Guarantees:
@@ -147,6 +147,20 @@ Guarantees:
 - `structured_output` is how a consumer gets machine-readable results without
   parsing prose. The `name` namespaces the payload; `value` is arbitrary JSON the
   agent produced. A turn may emit zero or more.
+- `turn_completed` carries a `usage` object accounting for the turn, so a consumer
+  can meter its own spend:
+
+  ```json
+  { "model": "claude-sonnet-5", "input_tokens": 2860, "output_tokens": 14,
+    "cache_read_input_tokens": 23055, "cache_creation_input_tokens": 5354,
+    "cost_usd": 0.0478, "duration_ms": 4853 }
+  ```
+
+  Token counts are the durable signal. `cost_usd` is Anthropic's list-price
+  estimate the runtime reports; it is nonzero even under stick's Max subscription
+  token (where there is no per-request charge) and becomes real spend only if stick
+  is ever run against an API key. The stub agent omits `usage`; a consumer must
+  tolerate its absence.
 - If the turn was queued, the stream opens immediately with one or more `queued`
   events and only then proceeds to `turn_started` once a stick is acquired. The
   consumer can render an hourglass off the first `queued` event.
@@ -238,11 +252,24 @@ stick emits DogStatsD to the nottingham-cloud metrics hub (arr-matey,
 instrument-on-the-way-in rule. The contract-relevant metrics, all tagged by
 `consumer`:
 
-- `stick.sessions.active` (gauge) - live sessions.
-- `stick.pool.in_use` / `stick.pool.total` (gauge) - stick utilization.
-- `stick.queue.depth` (gauge) - sessions waiting for a stick.
-- `stick.turn.latency` (timing) - turn start-to-complete.
-- `stick.turns.count` (count) - tagged by `stop_reason`.
+Shipped agentless to Datadog (v2 series HTTP API - the box runs no Datadog agent),
+enabled when `STICK_DD_API_KEY` is set. Pool/session/host gauges are sampled on the
+flush interval; per-turn metrics are recorded as each turn completes, tagged
+`consumer` + `model` (+ `status` on the count):
+
+- `stick.pool.sticks_total` / `stick.pool.sticks_in_use` / `stick.pool.queue_depth`
+  (gauge) - stick utilization and contention.
+- `stick.sessions.live` (gauge) - warm sessions.
+- `stick.turn.count` (count, tags `consumer`/`model`/`status`) - turn volume and
+  error rate.
+- `stick.turn.duration_ms` / `stick.turn.queue_wait_ms` (gauge) - turn latency and
+  time spent waiting for a stick.
+- `stick.turn.tokens.{input,output,cache_read,cache_write}` (count) and
+  `stick.turn.cost_usd` (count) - usage and estimated cost per consumer/model.
+- `stick.turn.max_rss_kb` (gauge) - peak RSS of the turn's claude process
+  (resource pressure).
+- `stick.host.mem_available_mb` / `stick.host.load1` (gauge) - box-level pressure
+  and competing processes on the LXC.
 
 These back the platform's dashboards and alerts; a consumer doesn't need them, but
 they're part of the service contract in the sense that the platform is observable by

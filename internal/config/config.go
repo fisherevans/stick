@@ -23,6 +23,13 @@ type Config struct {
 	SessionsDir string        // STICK_SESSIONS_DIR (claude workdirs), default /opt/stick/sessions
 	ClaudeModel string        // STICK_CLAUDE_MODEL (optional alias), default "" (CLI default)
 
+	// Metrics (agentless Datadog v2 series submission). Enabled iff DDAPIKey is
+	// set; otherwise a no-op sink. See internal/metrics.
+	DDAPIKey       string        // STICK_DD_API_KEY
+	DDSite         string        // STICK_DD_SITE, default https://api.us5.datadoghq.com
+	MetricsHostTag string        // STICK_METRICS_HOST_TAG, default "stick"
+	MetricsFlush   time.Duration // STICK_METRICS_FLUSH_SECONDS, default 20
+
 	// Secrets maps consumer id -> client secret. Loaded from STICK_SECRETS_FILE
 	// (JSON object) if set; otherwise from STICK_SECRETS_JSON inline (dev only).
 	Secrets map[string]string
@@ -43,8 +50,14 @@ func Load() (*Config, error) {
 		AgentMode:   env("STICK_AGENT", "stub"),
 		SessionsDir: env("STICK_SESSIONS_DIR", "/opt/stick/sessions"),
 		ClaudeModel: os.Getenv("STICK_CLAUDE_MODEL"),
-		Secrets:     map[string]string{},
-		Profiles:    map[string]agent.Profile{},
+
+		DDAPIKey:       os.Getenv("STICK_DD_API_KEY"),
+		DDSite:         env("STICK_DD_SITE", "https://api.us5.datadoghq.com"),
+		MetricsHostTag: env("STICK_METRICS_HOST_TAG", "stick"),
+		MetricsFlush:   time.Duration(envInt("STICK_METRICS_FLUSH_SECONDS", 20)) * time.Second,
+
+		Secrets:  map[string]string{},
+		Profiles: map[string]agent.Profile{},
 	}
 
 	if path := os.Getenv("STICK_SECRETS_FILE"); path != "" {

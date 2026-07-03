@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
+	"syscall"
 )
 
 // ClaudeFactory mints ClaudeAgents backed by the real Claude Code CLI. Each
@@ -83,8 +85,18 @@ type ClaudeAgent struct {
 	addDirs   []string
 	keepDir   bool // profile workdirs are not deleted on Close
 
-	mu    sync.Mutex
-	first bool // set true after the first turn assigns the session id
+	mu           sync.Mutex
+	first        bool  // set true after the first turn assigns the session id
+	lastMaxRSSKB int64 // peak RSS of the most recent turn's claude process (KB)
+}
+
+// LastMaxRSSKB returns the peak resident set size (KB) of the most recently
+// completed turn's claude subprocess, for resource-pressure metrics. 0 if no
+// turn has completed yet.
+func (a *ClaudeAgent) LastMaxRSSKB() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastMaxRSSKB
 }
 
 func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan Event {
@@ -146,6 +158,13 @@ func (a *ClaudeAgent) RunTurn(ctx context.Context, turnID, input string) <-chan 
 			}
 		}
 		werr := cmd.Wait()
+		if cmd.ProcessState != nil {
+			if ru, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
+				a.mu.Lock()
+				a.lastMaxRSSKB = ru.Maxrss // Linux: kilobytes
+				a.mu.Unlock()
+			}
+		}
 		if !completed {
 			msg := "claude exited before completing the turn"
 			if werr != nil {
@@ -203,7 +222,18 @@ func (a *ClaudeAgent) handleLine(line []byte, turnID string, seenTool map[string
 		if msg.IsError {
 			return emit(Event{KindError, ErrorData{Code: "agent_failed", Message: firstNonEmptyStr(msg.Result, msg.Subtype)}})
 		}
-		return emit(Event{KindTurnCompleted, TurnCompletedData{TurnID: turnID, StopReason: firstNonEmptyStr(msg.Subtype, "end_turn")}})
+		u := &Usage{
+			Model:      joinModels(msg.ModelUsage),
+			CostUSD:    msg.TotalCostUSD,
+			DurationMS: msg.DurationMS,
+		}
+		if msg.Usage != nil {
+			u.InputTokens = msg.Usage.InputTokens
+			u.OutputTokens = msg.Usage.OutputTokens
+			u.CacheReadInputTokens = msg.Usage.CacheReadInputTokens
+			u.CacheCreationInputTokens = msg.Usage.CacheCreationInputTokens
+		}
+		return emit(Event{KindTurnCompleted, TurnCompletedData{TurnID: turnID, StopReason: firstNonEmptyStr(msg.Subtype, "end_turn"), Usage: u}})
 	}
 	return true
 }
@@ -224,6 +254,41 @@ type claudeLine struct {
 	Result  string         `json:"result"`
 	Message *claudeMessage `json:"message"`
 	Event   *claudeEvent   `json:"event"`
+
+	// Populated on the terminal "result" line.
+	TotalCostUSD float64                     `json:"total_cost_usd"`
+	DurationMS   int64                       `json:"duration_ms"`
+	Usage        *claudeUsage                `json:"usage"`
+	ModelUsage   map[string]claudeModelUsage `json:"modelUsage"`
+}
+
+type claudeUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+}
+
+type claudeModelUsage struct {
+	CostUSD float64 `json:"costUSD"`
+}
+
+// joinModels renders the model(s) a turn used as a stable tag value. Usually one
+// model; joined with "+" and sorted for determinism when a turn spans models.
+func joinModels(m map[string]claudeModelUsage) string {
+	if len(m) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	out := names[0]
+	for _, n := range names[1:] {
+		out += "+" + n
+	}
+	return out
 }
 
 type claudeMessage struct {

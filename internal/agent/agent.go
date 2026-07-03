@@ -57,6 +57,23 @@ type StructuredOutputData struct {
 type TurnCompletedData struct {
 	TurnID     string `json:"turn_id"`
 	StopReason string `json:"stop_reason"`
+	Usage      *Usage `json:"usage,omitempty"`
+}
+
+// Usage is the resource accounting for a completed turn. It is surfaced to the
+// caller on turn_completed and mirrored into metrics. Token counts always
+// populate; CostUSD is Anthropic's list-price estimate the CLI reports - nonzero
+// even under a Max subscription token (where there is no per-request charge), and
+// only real spend under API-key billing. So treat tokens as the durable signal
+// and CostUSD as an estimate until/unless stick moves to an API key.
+type Usage struct {
+	Model                    string  `json:"model,omitempty"`
+	InputTokens              int64   `json:"input_tokens"`
+	OutputTokens             int64   `json:"output_tokens"`
+	CacheReadInputTokens     int64   `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64   `json:"cache_creation_input_tokens"`
+	CostUSD                  float64 `json:"cost_usd"`
+	DurationMS               int64   `json:"duration_ms"`
 }
 
 type ErrorData struct {

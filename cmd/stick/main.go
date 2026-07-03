@@ -5,10 +5,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"github.com/fisherevans/stick/internal/api"
 	"github.com/fisherevans/stick/internal/auth"
 	"github.com/fisherevans/stick/internal/config"
+	"github.com/fisherevans/stick/internal/metrics"
 	"github.com/fisherevans/stick/internal/semaphore"
 	"github.com/fisherevans/stick/internal/session"
 )
@@ -37,7 +41,29 @@ func main() {
 	pool := semaphore.New(cfg.Capacity)
 	mgr := session.NewManager(factory, cfg.IdleTimeout)
 	defer mgr.Close()
-	srv := api.NewServer(pool, mgr, auth.NewRegistry(cfg.Secrets))
+
+	// Metrics: agentless Datadog v2 submission, enabled iff a key is configured.
+	var sink *metrics.Sink
+	if cfg.DDAPIKey != "" {
+		sink = metrics.New(cfg.DDAPIKey, cfg.DDSite, cfg.MetricsHostTag, log)
+	} else {
+		sink = metrics.NewDisabled()
+	}
+	metricsCtx, stopMetrics := context.WithCancel(context.Background())
+	defer stopMetrics()
+	go sink.Run(metricsCtx, cfg.MetricsFlush, func() {
+		st := pool.Stats()
+		sink.Gauge("stick.pool.sticks_total", float64(st.Total))
+		sink.Gauge("stick.pool.sticks_in_use", float64(st.InUse))
+		sink.Gauge("stick.pool.queue_depth", float64(st.QueueDepth))
+		sink.Gauge("stick.sessions.live", float64(mgr.Count()))
+		if memMB, load1, ok := hostStats(); ok {
+			sink.Gauge("stick.host.mem_available_mb", memMB)
+			sink.Gauge("stick.host.load1", load1)
+		}
+	})
+
+	srv := api.NewServer(pool, mgr, auth.NewRegistry(cfg.Secrets), sink)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -52,6 +78,7 @@ func main() {
 		"idle_timeout", cfg.IdleTimeout.String(),
 		"agent", cfg.AgentMode,
 		"consumers", len(cfg.Secrets),
+		"metrics", sink.Enabled(),
 	)
 
 	go func() {
@@ -69,6 +96,35 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+}
+
+// hostStats reads box-level pressure from /proc: available memory (MB) and the
+// 1-minute load average. Lets the metrics sampler surface resource pressure and
+// competing processes on the LXC without a Datadog agent. Returns ok=false on a
+// non-Linux host or unreadable /proc.
+func hostStats() (memMB, load1 float64, ok bool) {
+	mem, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(mem), "\n") {
+		if strings.HasPrefix(line, "MemAvailable:") {
+			var kb float64
+			if _, err := fmt.Sscanf(line, "MemAvailable: %f kB", &kb); err == nil {
+				memMB = kb / 1024
+			}
+			break
+		}
+	}
+	load, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return memMB, 0, true
+	}
+	fields := strings.Fields(string(load))
+	if len(fields) > 0 {
+		load1, _ = strconv.ParseFloat(fields[0], 64)
+	}
+	return memMB, load1, true
 }
 
 // selectFactory picks the agent runtime: the real Claude Code CLI or the stub.
