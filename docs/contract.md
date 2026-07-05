@@ -90,12 +90,14 @@ for you. An explicit create exists for consumers that want to pre-warm:
 
 ```
 POST /v1/sessions
-{ "key": "discord:thread:1234", "idle_timeout_seconds": 900, "tools": [ ... ] }
+{ "key": "discord:thread:1234", "tools": [ ... ], "system_prompt": "...", "model": "opus" }
 ```
 
-`tools` (optional) declares **output tools** the session's agent can call to return
-structured data - see "Declaring tools" below. They bind to the session at
-creation and hold for its warm life.
+The body may carry the full **session configuration** (see "Session configuration"
+below): `tools`, `system_prompt`, `model`, `disallowed_tools`, and `seed`. Config
+binds to the session at creation and holds
+for its warm life; stick remembers it per key and re-applies it if the session is
+idle-evicted and recreated, so a consumer sets it once and it survives a rehydrate.
 
 Response `200`:
 
@@ -118,8 +120,14 @@ before the first turn; most consumers just post a turn.
 ```
 POST /v1/sessions/{key}/turns
 Accept: text/event-stream
-{ "input": "Summarize this article: ...", "metadata": { "any": "passthrough" } }
+{ "input": "Summarize this article: ...", "tools": [ ... ], "system_prompt": "..." }
 ```
+
+`input` is required. The turn may also carry any **session configuration** field
+(same set as create). Config is bound when the turn *creates* the session; on a
+turn against an already-warm session the config fields are ignored (config is
+fixed for a warm session's life). Send it on the turns that may create a session -
+a client that always sends it keeps its persona/tools/seed across a rehydrate.
 
 If the key has no live session, this creates one first (acquiring a stick or
 queuing). The response is an SSE stream. Each event has a named `event:` and a JSON
@@ -225,6 +233,35 @@ Notes:
   data) are a planned extension on this same surface (fisherevans/stick#9); output tools
   are the one-way subset.
 
+#### Required output (guaranteed structured result)
+
+Set `"required": true` on an output tool to make its result a guarantee rather than a
+hope. stick steers the turn to call the tool (it injects a directive so the model
+delivers its result through the tool, not as prose), and if the turn still ends without
+it, stick runs a bounded, invisible repair turn on the same session asking for it. The
+consumer's contract becomes: **declare a required output tool → you get exactly one
+`structured_output` frame with that name, or an explicit `error`** (`output_not_produced`)
+if even the repair could not produce it. This removes the consumer-side "did the model
+remember to call the tool?" retry logic.
+
+Reliability tracks model capability: a capable model (the default) calls a required tool
+essentially every turn once directed; a small/fast model is less consistent and may fall
+through to the `output_not_produced` error. Prefer a capable `model` for required output.
+
+### Session configuration
+
+Beyond `tools`, the create/turn body may carry these fields. All are optional, all bind
+at session creation, and all are remembered per key so an idle-evicted session recreates
+with them (a transparent rehydrate):
+
+| field | effect |
+| --- | --- |
+| `system_prompt` | Replaces the agent's default system prompt, so the session runs as the consumer's **persona** (e.g. a summarizer), not a generic coding agent. This is how a caller makes the LLM behave as its product expects. |
+| `model` | Per-consumer model override (e.g. `"opus"`), instead of the platform default. Set once per session, not per turn. |
+| `seed` | Grounding context prepended to the session's **first** turn (e.g. reference material the whole session reasons over). Remembered, so it is re-applied if the session is recreated. |
+| `disallowed_tools` | Tool policy: a **denylist** of tools to remove (e.g. `["ReportFindings","ToolSearch"]` to drop noise tools while keeping Bash/WebSearch and the output tools). A denylist is used rather than an allowlist because an allowlist (the CLI's `--tools`) drops the consumer's MCP output tools on resume turns; a denylist keeps every tool and just removes the named ones. |
+| `allowed_tools` | Optional permission allowlist passed through to the agent (e.g. `"Bash(git *)"`); rarely needed since sessions run with permissions bypassed. |
+
 ### Release a session
 
 ```
@@ -296,6 +333,7 @@ share one shape:
 | `429` | `queue_full` | acquire rejected because the queue is capped (only if a cap exists) |
 | `500` | `internal` | stick-side failure |
 | `error` event | `agent_failed` | the agent errored mid-turn; stream terminates |
+| `error` event | `output_not_produced` | a turn declared a required output tool and neither the turn nor the repair pass produced it (see "Required output"); terminal |
 | `error` event | `evicted` | the session was evicted mid-turn (rare; treat like a lost turn, retry) |
 
 Retries: a `token` stream that dies without a terminal event should be treated as a

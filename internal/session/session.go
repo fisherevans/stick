@@ -90,6 +90,10 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
+	// configs remembers the last caller-supplied SessionConfig per session id, so a
+	// session transparently recreated after an idle eviction is rebuilt with the
+	// same persona/tools/seed. Kept across eviction; dropped on explicit Delete.
+	configs map[string]agent.SessionConfig
 
 	create keyedMutex
 
@@ -102,10 +106,23 @@ func NewManager(factory agent.Factory, idleTimeout time.Duration) *Manager {
 		factory:     factory,
 		idleTimeout: idleTimeout,
 		sessions:    map[string]*Session{},
+		configs:     map[string]agent.SessionConfig{},
 		stop:        make(chan struct{}),
 	}
 	go m.sweep()
 	return m
+}
+
+func (m *Manager) rememberConfig(sid string, cfg agent.SessionConfig) {
+	m.mu.Lock()
+	m.configs[sid] = cfg
+	m.mu.Unlock()
+}
+
+func (m *Manager) configFor(sid string) agent.SessionConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.configs[sid]
 }
 
 func id(consumer, key string) string { return consumer + "\x00" + key }
@@ -120,25 +137,33 @@ func (m *Manager) Get(consumer, key string) (*Session, bool) {
 
 // Ensure returns the live session for (consumer, key), creating one if absent.
 // Creating a session is cheap (no stick, no process); the stick is acquired
-// per turn by the caller. tools are the consumer-declared output tools bound to
-// the session at creation; they are ignored if the session already exists (tools
-// are fixed for a warm session's life). The bool reports whether one was created.
-func (m *Manager) Ensure(ctx context.Context, consumer, key string, tools []agent.Tool) (*Session, bool, error) {
+// per turn by the caller.
+//
+// cfg is the caller-supplied session config, bound when a session is created and
+// remembered per (consumer, key): a non-empty cfg updates the remembered config
+// (used the next time a session is created), and every creation - including
+// transparent recreation after an idle eviction - uses the remembered config. So
+// a consumer supplies its persona/tools/seed once and keeps them across a
+// rehydrate, and a later turn that omits cfg does not silently drop them. cfg is
+// fixed for a warm session's life; changing it takes effect on the next creation.
+// The bool reports whether a session was created.
+func (m *Manager) Ensure(ctx context.Context, consumer, key string, cfg agent.SessionConfig) (*Session, bool, error) {
 	sid := id(consumer, key)
 
-	if s, ok := m.Get(consumer, key); ok {
-		return s, false, nil
-	}
-
-	// Serialize creators for this key.
+	// Serialize creators for this key (also guards the remembered-config update
+	// against a concurrent recreate).
 	m.create.Lock(sid)
 	defer m.create.Unlock(sid)
 
+	if !cfg.IsZero() {
+		m.rememberConfig(sid, cfg)
+	}
+
 	if s, ok := m.Get(consumer, key); ok {
 		return s, false, nil
 	}
 
-	ag, err := m.factory.NewAgent(ctx, consumer, key, tools)
+	ag, err := m.factory.NewAgent(ctx, consumer, key, m.configFor(sid))
 	if err != nil {
 		return nil, false, err
 	}
@@ -153,8 +178,11 @@ func (m *Manager) Ensure(ctx context.Context, consumer, key string, tools []agen
 	return s, true, nil
 }
 
-// Delete evicts and closes the session for (consumer, key). Idempotent; reports
-// whether a session was present.
+// Delete evicts and closes the session for (consumer, key), and forgets its
+// remembered config: an explicit release means the consumer is done, so a later
+// turn on the same key starts fresh rather than resurrecting a stale persona.
+// (Idle eviction, by contrast, keeps the config so a rehydrate is transparent.)
+// Idempotent; reports whether a session was present.
 func (m *Manager) Delete(consumer, key string) bool {
 	sid := id(consumer, key)
 	m.mu.Lock()
@@ -162,6 +190,7 @@ func (m *Manager) Delete(consumer, key string) bool {
 	if ok {
 		delete(m.sessions, sid)
 	}
+	delete(m.configs, sid)
 	m.mu.Unlock()
 	if ok {
 		s.close()

@@ -51,10 +51,32 @@ func (s *Server) Handler() http.Handler {
 
 // --- wire types (see docs/contract.md) ---
 
+// sessionConfigReq is the caller-supplied session configuration shared by the
+// create and turn requests. It is bound when a session is created and remembered
+// across idle eviction (see session.Manager.Ensure).
+type sessionConfigReq struct {
+	Tools           []agent.Tool `json:"tools,omitempty"`
+	SystemPrompt    string       `json:"system_prompt,omitempty"`
+	Model           string       `json:"model,omitempty"`
+	AllowedTools    []string     `json:"allowed_tools,omitempty"`
+	DisallowedTools []string     `json:"disallowed_tools,omitempty"`
+	Seed            string       `json:"seed,omitempty"`
+}
+
+func (r sessionConfigReq) toConfig() agent.SessionConfig {
+	return agent.SessionConfig{
+		Tools:        r.Tools,
+		SystemPrompt: r.SystemPrompt,
+		Model:        r.Model,
+		AllowTools:   r.AllowedTools,
+		DenyTools:    r.DisallowedTools,
+		Seed:         r.Seed,
+	}
+}
+
 type createReq struct {
-	Key                string       `json:"key"`
-	IdleTimeoutSeconds int          `json:"idle_timeout_seconds,omitempty"`
-	Tools              []agent.Tool `json:"tools,omitempty"`
+	Key string `json:"key"`
+	sessionConfigReq
 }
 
 type sessionResp struct {
@@ -64,9 +86,8 @@ type sessionResp struct {
 }
 
 type turnReq struct {
-	Input    string          `json:"input"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
-	Tools    []agent.Tool    `json:"tools,omitempty"` // bound to the session if this turn creates it
+	Input string `json:"input"`
+	sessionConfigReq
 }
 
 type turnStartedData struct {
@@ -95,7 +116,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// Creating a session is cheap (no stick held until a turn runs), so this
 	// returns immediately. Queue backpressure surfaces on the turn stream.
-	sess, _, err := s.sessions.Ensure(r.Context(), consumer, body.Key, body.Tools)
+	sess, _, err := s.sessions.Ensure(r.Context(), consumer, body.Key, body.toConfig())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return
@@ -135,7 +156,7 @@ func (s *Server) sendTurn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get or create the warm session (cheap: no stick until a turn runs).
-	sess, _, err := s.sessions.Ensure(r.Context(), consumer, key, body.Tools)
+	sess, _, err := s.sessions.Ensure(r.Context(), consumer, key, body.toConfig())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return

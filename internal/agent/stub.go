@@ -10,7 +10,7 @@ import (
 // the platform can be exercised end to end locally.
 type StubFactory struct{}
 
-func (StubFactory) NewAgent(_ context.Context, _, sessionKey string, _ []Tool) (Agent, error) {
+func (StubFactory) NewAgent(_ context.Context, _, sessionKey string, _ SessionConfig) (Agent, error) {
 	return &StubAgent{key: sessionKey}, nil
 }
 

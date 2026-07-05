@@ -97,11 +97,49 @@ type Agent interface {
 }
 
 // Factory mints an Agent for a session. consumer + sessionKey let the real
-// implementation place the session in the right environment (see Profile); tools
-// are the consumer-declared output tools the session exposes (see Tool). The stub
-// ignores all three.
+// implementation place the session in the right environment (see Profile); cfg is
+// the caller-supplied session configuration bound for the life of the session
+// (tools, persona, model, tool policy, seed). The stub ignores all of it.
 type Factory interface {
-	NewAgent(ctx context.Context, consumer, sessionKey string, tools []Tool) (Agent, error)
+	NewAgent(ctx context.Context, consumer, sessionKey string, cfg SessionConfig) (Agent, error)
+}
+
+// SessionConfig is the caller-supplied configuration bound to a session when it is
+// created. It is set once (on the create/first-turn request), remembered by the
+// session manager, and re-applied verbatim if an idle-evicted session is
+// transparently recreated - so a consumer's persona, tools, and seed survive a
+// rehydrate without the consumer detecting the eviction.
+type SessionConfig struct {
+	// Tools are the consumer-declared output tools the session exposes (see Tool).
+	Tools []Tool
+	// SystemPrompt replaces the agent's default system prompt for the session
+	// (claude --system-prompt), so the LLM runs as the consumer's persona rather
+	// than as a generic coding agent. Empty keeps the default.
+	SystemPrompt string
+	// Model overrides the factory's default model for this session (claude
+	// --model). Empty uses the factory default.
+	Model string
+	// AllowTools / DenyTools are the session's tool policy (claude --allowedTools /
+	// --disallowedTools), e.g. DenyTools ["ReportFindings","ToolSearch"] to drop
+	// noise tools while keeping useful ones like Bash/WebSearch. A denylist is used
+	// rather than an allowlist because an allowlist (claude --tools) filters the set
+	// in a way that drops the consumer's MCP output tools on resume turns; a
+	// denylist leaves every tool - including output tools - and just removes the
+	// named ones.
+	AllowTools []string
+	DenyTools  []string
+	// Seed is optional grounding context prepended to the session's first turn
+	// (e.g. reference material). Because it is remembered with the config, it is
+	// re-applied when an evicted session is recreated, so the grounding survives.
+	Seed string
+}
+
+// IsZero reports whether the config carries nothing to bind - i.e. a turn that
+// supplied no session config, so the session manager should keep whatever it
+// already remembered rather than overwrite it.
+func (c SessionConfig) IsZero() bool {
+	return len(c.Tools) == 0 && c.SystemPrompt == "" && c.Model == "" &&
+		len(c.AllowTools) == 0 && len(c.DenyTools) == 0 && c.Seed == ""
 }
 
 // Tool is a consumer-declared tool the agent can call during a turn. Today only
@@ -119,6 +157,11 @@ type Tool struct {
 	// this tool; defaults to Name. Lets a consumer name a tool `emit_node` but
 	// receive a structured_output named `node`.
 	OutputName string `json:"output_name,omitempty"`
+	// Required marks an output tool the turn MUST produce. If the agent finishes a
+	// turn without having called a required tool, stick issues a bounded repair
+	// turn asking for it, guaranteeing the consumer a structured_output frame (or
+	// an explicit error). See the agent's turn loop.
+	Required bool `json:"required,omitempty"`
 }
 
 // Profile is a per-consumer session environment. A consumer with a profile runs
