@@ -524,6 +524,14 @@ func (a *ClaudeAgent) handleLine(line []byte, st *turnState, completed *bool, em
 					continue
 				}
 				if st.outToolIDs[b.ToolUseID] {
+					// A rejected output-tool call (the MCP server returned isError
+					// because the argument failed schema validation) is NOT the result:
+					// swallow it and let the agent retry with a corrected argument
+					// in-turn. Only a valid call becomes a structured_output frame.
+					if b.IsError {
+						delete(st.pendingOut, b.ToolUseID)
+						continue
+					}
 					val, ok := st.pendingOut[b.ToolUseID]
 					if !ok {
 						val = json.RawMessage("null")

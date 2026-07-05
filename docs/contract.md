@@ -229,6 +229,13 @@ Notes:
   call `emit_node` with the node").
 - Output-tool calls do **not** produce `tool_start`/`tool_end` frames (they're the
   result channel, not user-facing tool activity). Other tools the agent uses still do.
+- **The argument is validated against `input_schema` in-band.** If the agent calls
+  the tool with an argument that violates the schema, stick's tool rejects the call
+  with the specific validation errors (which field, what's wrong), so the agent
+  corrects and re-calls within the same turn - the same loop as any CLI that demands
+  valid structured input. Only a schema-valid call becomes a `structured_output`
+  frame, so a consumer's declared schema is a real guarantee, not a hint. Declare
+  precise schemas (types, `required`, enums) and let the runtime enforce them.
 - Round-trip **callback tools** (the agent calling back into the consumer mid-turn for
   data) are a planned extension on this same surface (fisherevans/stick#9); output tools
   are the one-way subset.

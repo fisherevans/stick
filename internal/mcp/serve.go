@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // ToolDef is the on-disk shape of a tool the server advertises. It mirrors the
@@ -39,8 +42,10 @@ type rpcRequest struct {
 }
 
 // Serve runs the stdio MCP loop over in/out, advertising tools. It returns when
-// in reaches EOF.
+// in reaches EOF. Each tool's inputSchema is compiled once so tools/call can
+// validate the agent's argument and reject bad input in-band (see validators).
 func Serve(in io.Reader, out io.Writer, tools []ToolDef) error {
+	validators := compileValidators(tools)
 	enc := json.NewEncoder(out)
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -84,8 +89,23 @@ func Serve(in io.Reader, out io.Writer, tools []ToolDef) error {
 			}
 			writeResult(enc, req.ID, map[string]any{"tools": list})
 		case "tools/call":
-			// Output tools: acknowledge. stick reads the structured argument from
-			// the session stream, so nothing is returned to the agent but an ack.
+			// Validate the argument against the tool's schema and reject bad input
+			// in-band: an isError result makes the agent see the failure and correct
+			// within the turn - the same loop you'd get fighting any CLI that demands
+			// valid structured input. Only a valid call is "recorded"; stick reads the
+			// structured argument itself from the session stream.
+			var p struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			if msg := validate(validators[p.Name], p.Arguments); msg != "" {
+				writeResult(enc, req.ID, map[string]any{
+					"isError": true,
+					"content": []map[string]any{{"type": "text", "text": msg}},
+				})
+				break
+			}
 			writeResult(enc, req.ID, map[string]any{
 				"content": []map[string]any{{"type": "text", "text": "recorded"}},
 			})
@@ -94,6 +114,62 @@ func Serve(in io.Reader, out io.Writer, tools []ToolDef) error {
 		}
 	}
 	return sc.Err()
+}
+
+// compileValidators compiles each tool's inputSchema into a validator, keyed by
+// tool name. A tool with no schema (or an uncompilable one) maps to nil, which
+// validate treats as "accept anything".
+func compileValidators(tools []ToolDef) map[string]*jsonschema.Schema {
+	out := make(map[string]*jsonschema.Schema, len(tools))
+	for _, t := range tools {
+		if len(t.InputSchema) == 0 {
+			out[t.Name] = nil
+			continue
+		}
+		doc, err := jsonschema.UnmarshalJSON(strings.NewReader(string(t.InputSchema)))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcp: tool %q schema unreadable, skipping validation: %v\n", t.Name, err)
+			out[t.Name] = nil
+			continue
+		}
+		c := jsonschema.NewCompiler()
+		res := "stick:" + t.Name
+		if err := c.AddResource(res, doc); err != nil {
+			out[t.Name] = nil
+			continue
+		}
+		sch, err := c.Compile(res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcp: tool %q schema won't compile, skipping validation: %v\n", t.Name, err)
+			out[t.Name] = nil
+			continue
+		}
+		out[t.Name] = sch
+	}
+	return out
+}
+
+// validate checks raw arguments against a compiled schema, returning "" if valid
+// (or if there is no schema) or a human-readable, model-actionable error message
+// describing what is wrong so the agent can fix its next call.
+func validate(sch *jsonschema.Schema, raw json.RawMessage) string {
+	if sch == nil {
+		return ""
+	}
+	arg := any(map[string]any{})
+	if len(raw) > 0 {
+		v, err := jsonschema.UnmarshalJSON(strings.NewReader(string(raw)))
+		if err != nil {
+			return "the tool argument was not valid JSON: " + err.Error()
+		}
+		arg = v
+	}
+	if err := sch.Validate(arg); err != nil {
+		// jsonschema's Error() is a readable, location-tagged description of every
+		// failure - exactly what the agent needs to correct its next call.
+		return "the argument does not match the tool's schema. Fix these and call it again:\n" + err.Error()
+	}
+	return ""
 }
 
 // LoadTools reads the tools file written by stick.
